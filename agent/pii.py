@@ -30,10 +30,73 @@ set ở tests/vn_pii_testset.jsonl):
 """
 from __future__ import annotations
 
+import re
+
+# Thứ tự ưu tiên khi 2 loại cùng khớp một vùng ký tự (áp dụng lúc lọc
+# overlap): EMAIL/CCCD/PHONE là các mẫu "chắc chắn" hơn STK (chỉ là dãy số
+# trần), nên STK bị loại nếu trùng vùng với 1 trong 3 loại kia.
+_PRIORITY = {"EMAIL": 0, "VN_CCCD": 1, "VN_PHONE": 2, "VN_BANK_ACCOUNT": 3}
+
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+# CCCD: đúng 12 chữ số liên tiếp, không đứng liền số/chữ khác 2 bên
+# (word boundary số không hoạt động tốt vì \b coi chữ số là "word char" —
+# dùng lookaround thủ công để tránh khớp vào giữa 1 dãy số dài hơn).
+_CCCD_RE = re.compile(r"(?<!\d)\d{12}(?!\d)")
+# SĐT VN: bắt đầu bằng 0, tổng 10-11 chữ số, cho phép khoảng trắng/gạch nối
+_PHONE_RE = re.compile(r"(?<!\d)0[\d\-\s]{8,10}\d(?!\d)")
+# STK: 8-16 chữ số liên tiếp (rộng hơn CCCD/PHONE nên xử lý overlap sau)
+_BANK_RE = re.compile(r"(?<!\d)\d{8,16}(?!\d)")
+
+
+_BANK_CONTEXT_RE = re.compile(r"(stk|so tai khoan|tai khoan)", re.IGNORECASE)
+
+
+def _has_bank_context(text: str, start: int) -> bool:
+    window = text[max(0, start - 20) : start]
+    normalized = window.lower().replace("ố", "o").replace("à", "a")
+    return bool(_BANK_CONTEXT_RE.search(normalized)) or "stk" in window.lower()
+
+
+def _raw_matches(text: str) -> list[dict]:
+    matches: list[dict] = []
+    for m in _EMAIL_RE.finditer(text):
+        matches.append({"type": "EMAIL", "start": m.start(), "end": m.end()})
+    for m in _CCCD_RE.finditer(text):
+        # 12 chữ số ngay sau ngữ cảnh "STK"/"tài khoản" -> STK, không phải CCCD
+        entity_type = "VN_BANK_ACCOUNT" if _has_bank_context(text, m.start()) else "VN_CCCD"
+        matches.append({"type": entity_type, "start": m.start(), "end": m.end()})
+    for m in _PHONE_RE.finditer(text):
+        digits = re.sub(r"\D", "", m.group())
+        if len(digits) in (10, 11):
+            matches.append({"type": "VN_PHONE", "start": m.start(), "end": m.end()})
+    for m in _BANK_RE.finditer(text):
+        matches.append({"type": "VN_BANK_ACCOUNT", "start": m.start(), "end": m.end()})
+    return matches
+
+
+def _overlaps(a: dict, b: dict) -> bool:
+    return a["start"] < b["end"] and b["start"] < a["end"]
+
 
 def detect(text: str) -> list[dict]:
-    raise NotImplementedError("BƯỚC 3a: implement PII detection")
+    candidates = _raw_matches(text)
+    # Sắp theo (span dài nhất trước, rồi priority) để khi loại overlap, giữ
+    # lại ứng viên "chắc chắn" nhất cho mỗi vùng ký tự.
+    candidates.sort(key=lambda e: (-(e["end"] - e["start"]), _PRIORITY[e["type"]]))
+
+    kept: list[dict] = []
+    for cand in candidates:
+        if any(_overlaps(cand, k) for k in kept):
+            continue
+        kept.append(cand)
+
+    kept.sort(key=lambda e: e["start"])
+    return kept
 
 
 def redact(text: str) -> str:
-    raise NotImplementedError("BƯỚC 3a: implement PII redaction")
+    entities = sorted(detect(text), key=lambda e: e["start"], reverse=True)
+    for entity in entities:
+        placeholder = f"[REDACTED_{entity['type']}]"
+        text = text[: entity["start"]] + placeholder + text[entity["end"] :]
+    return text
