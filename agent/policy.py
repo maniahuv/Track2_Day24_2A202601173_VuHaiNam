@@ -37,4 +37,27 @@ class PolicyContext:
 
 
 def check(context: PolicyContext) -> tuple[bool, str]:
-    raise NotImplementedError("BƯỚC 3b: implement policy check")
+    # Rule tối thiểu bắt buộc: dữ liệu restricted không bao giờ được đi
+    # cùng 1 run có egress bật — đây chính là chân chặn exfil trong trifecta.
+    if context.data_classification == "restricted" and context.egress_enabled:
+        return False, (
+            f"deny: data_classification=restricted và egress_enabled=True "
+            f"(agent_owner={context.agent_owner}, purpose={context.request_purpose}) "
+            "— dữ liệu nhạy cảm không được rời hệ thống trong cùng run có egress."
+        )
+
+    # Siết thêm: delegation sâu (agent gọi agent, depth > 0) không được tự
+    # ý bật egress cho dữ liệu restricted/internal — chỉ run gốc (depth=0)
+    # mới được coi là có đủ ngữ cảnh người dùng để quyết định gửi đi.
+    if context.delegation_depth > 0 and context.egress_enabled and context.data_classification != "public":
+        return False, (
+            f"deny: delegation_depth={context.delegation_depth} > 0 với egress_enabled=True "
+            f"trên dữ liệu {context.data_classification} — run bị delegate không được tự ý gọi egress "
+            f"(agent_owner={context.agent_owner})."
+        )
+
+    return True, (
+        f"allow: classification={context.data_classification}, "
+        f"egress_enabled={context.egress_enabled}, purpose={context.request_purpose} "
+        f"— không khớp rule deny nào (agent_owner={context.agent_owner})."
+    )

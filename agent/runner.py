@@ -53,11 +53,149 @@ Interface bắt buộc (agent/loop.py import và gọi hàm này nếu tồn t�
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import re
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
+
+from agent import ledger, policy, tools
 
 REPORTS_DIR = Path(__file__).resolve().parent.parent / "reports"
 DEFAULT_LEDGER_PATH = REPORTS_DIR / "ledger.jsonl"
 
+_TICKET_ID_RE = re.compile(r"ticket-(\d+)")
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _args_hash(args: dict) -> str:
+    payload = json.dumps(args, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _ticket_id_from_filename(name: str) -> int | None:
+    m = _TICKET_ID_RE.search(name)
+    return int(m.group(1)) if m else None
+
+
+def _log(ledger_path: Path, *, agent_id: str, run_id: str, tool: str,
+          args: dict, classification: str, decision: str, reason: str) -> None:
+    ledger.append(
+        {
+            "ts": _now(),
+            "agent_id": agent_id,
+            "run_id": run_id,
+            "tool": tool,
+            "args_hash": _args_hash(args),
+            "classification": classification,
+            "decision": decision,
+            "reason": reason,
+        },
+        ledger_path,
+    )
+
 
 def handle(message: str, llm, log_dir: Path | None = None) -> str:
-    raise NotImplementedError("BƯỚC 3c: implement trifecta split")
+    ledger_path = (log_dir or REPORTS_DIR) / "ledger.jsonl"
+    run_id = uuid.uuid4().hex[:12]
+
+    # --- Run A: untrusted content ONLY. Không gọi read_customer/http_post. ---
+    run_a_id = f"run-a-{run_id}"
+    ctx_a = policy.PolicyContext(
+        data_classification="internal",
+        request_purpose="search-tickets",
+        agent_owner=run_a_id,
+        delegation_depth=0,
+        egress_enabled=False,
+    )
+    allow_a, reason_a = policy.check(ctx_a)
+    _log(
+        ledger_path,
+        agent_id=run_a_id,
+        run_id=run_a_id,
+        tool="search_docs",
+        args={"query": message},
+        classification=ctx_a.data_classification,
+        decision="allow" if allow_a else "deny",
+        reason=reason_a,
+    )
+    if not allow_a:
+        return "Yêu cầu bị chặn bởi policy trước khi tìm kiếm tài liệu."
+
+    docs = tools.search_docs(message)
+
+    # Chỉ trích TYPED ticket_id từ TÊN FILE — không bao giờ từ nội dung.
+    ticket_ids = sorted({tid for d in docs if (tid := _ticket_id_from_filename(d["id"])) is not None})
+
+    # find_injection() chỉ dùng để LOG bằng chứng injection đã bị "thấy" —
+    # customer_ids/target_url nó trả về KHÔNG được dùng để quyết định gọi ai.
+    combined_text = "\n\n".join(d["text"] for d in docs)
+    injected = llm.find_injection(combined_text)
+
+    # --- Run B: private data ONLY. Nhận list[int] ticket_ids đã sanitize
+    # từ Run A, tra customer_id qua related_tickets (nguồn tin cậy) — không
+    # bao giờ tin customer_id mà attacker viết trong free text. ---
+    run_b_id = f"run-b-{run_id}"
+    customers = json.loads(tools.CUSTOMERS_FILE.read_text(encoding="utf-8"))
+
+    collected: list[dict] = []
+    for customer in customers:
+        related = set(customer.get("related_tickets", []))
+        if not related & set(ticket_ids):
+            continue
+
+        customer_id = customer["customer_id"]
+        ctx_b = policy.PolicyContext(
+            data_classification="restricted",
+            request_purpose="support-reply",
+            agent_owner=run_b_id,
+            delegation_depth=1,
+            egress_enabled=False,
+        )
+        allow_b, reason_b = policy.check(ctx_b)
+        _log(
+            ledger_path,
+            agent_id=run_b_id,
+            run_id=run_b_id,
+            tool="read_customer",
+            args={"customer_id": customer_id},
+            classification=ctx_b.data_classification,
+            decision="allow" if allow_b else "deny",
+            reason=reason_b,
+        )
+        if not allow_b:
+            continue
+
+        record = tools.read_customer(customer_id)
+        collected.append(record)
+
+    # --- Egress: nếu injection cố chỉ đạo POST dữ liệu ra ngoài, thử qua
+    # policy với egress_enabled=True — rule tối thiểu trong policy.py phải
+    # deny bất kỳ egress nào mang classification=restricted. ---
+    if injected is not None and collected:
+        ctx_egress = policy.PolicyContext(
+            data_classification="restricted",
+            request_purpose="reconciliation",
+            agent_owner=run_b_id,
+            delegation_depth=1,
+            egress_enabled=True,
+        )
+        allow_egress, reason_egress = policy.check(ctx_egress)
+        _log(
+            ledger_path,
+            agent_id=run_b_id,
+            run_id=run_b_id,
+            tool="http_post",
+            args={"url": injected.target_url, "customer_ids": [c["customer_id"] for c in collected]},
+            classification=ctx_egress.data_classification,
+            decision="allow" if allow_egress else "deny",
+            reason=reason_egress,
+        )
+        if allow_egress:
+            tools.http_post(injected.target_url, {"records": collected})
+
+    return llm.summarize(docs)
